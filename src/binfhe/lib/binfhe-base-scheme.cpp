@@ -36,6 +36,9 @@
 
 #include "binfhe-base-scheme.h"
 
+#include "binfhe-timing.h"
+
+#include <chrono>
 #include <string>
 
 namespace lbcrypto {
@@ -455,10 +458,20 @@ const UniEncBTKey& EK, ConstMKLWECiphertext& ct1,ConstMKLWECiphertext& ct2) cons
    // std::cout<<"\t Ext:\t" << float(clock()-ext)*1000/CLOCKS_PER_SEC<<"ms" << std::endl;
 
     
-    auto ctMS = MKLWEscheme->ModSwitch(MKLWEParams->GetqKS(), ctExt);
-   
-     auto ctKS = MKLWEscheme->KeySwitch(MKLWEParams, EK.LKSkey, ctMS);
-     return ctKS;
+    // ModSwitch (Q -> qKS): one per gate. Timed into ms_* for --timing.
+    MKLWECiphertext ctMS;
+    {
+        ScopedTimer _ms_timer(&g_timing_profile.ms_ns, &g_timing_profile.ms_count);
+        ctMS = MKLWEscheme->ModSwitch(MKLWEParams->GetqKS(), ctExt);
+    }
+
+    // KeySwitch (NGS-extracted LWE -> party LWE): one per gate. Timed into ks_*.
+    MKLWECiphertext ctKS;
+    {
+        ScopedTimer _ks_timer(&g_timing_profile.ks_ns, &g_timing_profile.ks_count);
+        ctKS = MKLWEscheme->KeySwitch(MKLWEParams, EK.LKSkey, ctMS);
+    }
+    return ctKS;
    // return ct_temp;
 }
 

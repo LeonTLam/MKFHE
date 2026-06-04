@@ -31,6 +31,8 @@
 
 #include "mk-acc-xzw_B.h"
 
+#include "binfhe-timing.h"
+
 #include <string>
 
 namespace lbcrypto {
@@ -115,17 +117,23 @@ void UniEncAccumulatorXZW_B::EvalAcc(const std::shared_ptr<UniEncCryptoParams>& 
    
     for (uint32_t u = 0; u < k; u++) {
         for (size_t i = 0; i < n; ++i) {
+            // Time each CMux step (the fused monomial rotation + hybrid product).
+            // One ScopedTimer per loop iteration => cmux_count == n*k per gate,
+            // matching the bench's projected per-bootstrap count. The HbProd
+            // call below is timed separately into ext_*, so ext is a strict
+            // sub-component of cmux (nested), reported as its own row.
+            ScopedTimer _cmux_timer(&g_timing_profile.cmux_ns, &g_timing_profile.cmux_count);
             if (u == 0 && i == 0) {
                 // cout << "u = "<<u<<" i = "<<i << endl;
                 AddToAccXZW0(params, (*ek)[u][0][n], (*ek)[u][0][i], ct[u][i], Pkey, u, acc,skf);
-                
+
             }
 
             else {
                 // cout << "u = "<<u<<" i = "<<i << endl;
                 AddToAccXZW(params, (*ek)[u][0][i], ct[u][i], Pkey, u, acc,skf);
 
-              
+
             }
         }
     }
@@ -221,7 +229,11 @@ UniEncEvalKey UniEncAccumulatorXZW_B::KDMKeyGenXZW(const std::shared_ptr<UniEncC
 void UniEncAccumulatorXZW_B::HbProd(const std::shared_ptr<UniEncCryptoParams>& params, std::vector<NativePoly>& d,
                                   std::vector<NativePoly>& f, uint32_t index, std::vector<std::vector<NativePoly>> Pkey,
                                   MKACCCiphertext& acc) const {
-    
+    // External/hybrid product timing (ext_*). Called once per CMux step, so
+    // ext_count == cmux_count == n*k per gate; the bench reports this as the
+    // "ExternalProduct" row (a sub-cost of "CMux+ExtProduct").
+    ScopedTimer _ext_timer(&g_timing_profile.ext_ns, &g_timing_profile.ext_count);
+
     std::vector<NativePoly> ct(acc->GetElements());  //(c1,...,c_k)
     auto k = params->Getk();
 
