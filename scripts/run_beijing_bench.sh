@@ -55,14 +55,18 @@ for idx in "${!ks[@]}"; do
     echo "=================================================================="
     echo " k=$k  l=$l   --noise-growth  (reps=$REPS)"
     echo "=================================================================="
-    "$BENCH" "$k" --noise-growth --reps "$REPS"
-    mv -f bench_growth_mklwe.csv "$OUTDIR/beijing_k${k}_l${l}_growth.csv"
+    # --csv / --keygen-csv make the bench write the final filenames directly:
+    # no fixed-name + rename, and concurrent runs never clobber each other.
+    "$BENCH" "$k" --noise-growth --reps "$REPS" \
+        --csv        "$OUTDIR/beijing_k${k}_l${l}_growth.csv" \
+        --keygen-csv "$OUTDIR/beijing_k${k}_l${l}_growth_keygen.csv"
 
     echo "=================================================================="
     echo " k=$k  l=$l   --noise          (reps=$REPS)"
     echo "=================================================================="
-    "$BENCH" "$k" --noise --reps "$REPS"
-    mv -f bench_components_mklwe.csv "$OUTDIR/beijing_k${k}_l${l}_noise.csv"
+    "$BENCH" "$k" --noise --reps "$REPS" \
+        --csv        "$OUTDIR/beijing_k${k}_l${l}_noise.csv" \
+        --keygen-csv "$OUTDIR/beijing_k${k}_l${l}_noise_keygen.csv"
 done
 
 echo

@@ -970,11 +970,15 @@ static void print_usage(const char* prog) {
         "  --growth, --noise-growth   LWE noise-budget trajectory (grow via Add,\n"
         "                            reset via Bootstrap). CSV -> bench_growth_mklwe.csv\n\n"
         "Options:\n"
-        "  --reps N      Sample count (default 20; --timing defaults to 100).\n"
-        "  -h, --help    Show this help.\n\n"
-        "EVERY mode also writes bench_keygen_mklwe.csv (one row per k with\n"
+        "  --reps N        Sample count (default 20; --timing defaults to 100).\n"
+        "  --csv PATH      Write the active mode's CSV to PATH instead of the\n"
+        "                  default bench_<mode>_mklwe.csv (final name written\n"
+        "                  directly -- no rename needed).\n"
+        "  --keygen-csv P  Write the keygen CSV to P instead of bench_keygen_mklwe.csv.\n"
+        "  -h, --help      Show this help.\n\n"
+        "EVERY mode also writes a keygen CSV (one row per k with\n"
         "GenerateBinFHEContext / MKLWE_KeyGen / MKBTKeyGen timings and per-key\n"
-        "material sizes in bytes + MB).\n\n"
+        "material sizes in bytes + MB); default name bench_keygen_mklwe.csv.\n\n"
         "Default mode runs the full protocol scenario (Setup, Encryption,\n"
         "NAND+Bootstrap, level-2 gate, Decryption, summary).\n"
         "CSV -> bench_protocol_mklwe.csv\n";
@@ -984,6 +988,8 @@ int main(int argc, char* argv[]) {
     Mode mode   = Mode::Protocol;
     int  reps   = -1;
     int  only_k = 0;
+    std::string csv_path;        // --csv: override the active mode's CSV path
+    std::string keygen_path;     // --keygen-csv: override the keygen CSV path
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -992,6 +998,8 @@ int main(int argc, char* argv[]) {
         else if (a == "--components" || a == "--noise"){ mode = Mode::Components; }
         else if (a == "--growth" || a == "--noise-growth") { mode = Mode::Growth; }
         else if (a == "--reps" && i + 1 < argc)        { reps = std::atoi(argv[++i]); }
+        else if (a == "--csv" && i + 1 < argc)         { csv_path = argv[++i]; }
+        else if (a == "--keygen-csv" && i + 1 < argc)  { keygen_path = argv[++i]; }
         else if (a.size() > 0 && a[0] != '-')          { only_k = std::atoi(a.c_str()); }
         else {
             std::cerr << "Unknown option: " << a << "\n";
@@ -1001,57 +1009,68 @@ int main(int argc, char* argv[]) {
     if (reps < 0) reps = (mode == Mode::Timing) ? 100 : 20;
     if (reps < 1) reps = 1;
 
+    // CSV destinations: --csv / --keygen-csv override the defaults so the wrapper
+    // can ask for the final filename directly (no fixed-name + rename dance).
+    auto pick = [](const std::string& override_path, const char* def) {
+        return override_path.empty() ? std::string(def) : override_path;
+    };
+    const std::string keygen_name = pick(keygen_path, "bench_keygen_mklwe.csv");
+
     // Keygen CSV is written in EVERY mode.
-    std::ofstream keygen_csv("bench_keygen_mklwe.csv");
+    std::ofstream keygen_csv(keygen_name);
     write_keygen_csv_header(keygen_csv);
 
     int rc = 0;
     switch (mode) {
     case Mode::Timing: {
-        std::ofstream timing_csv("bench_timing_mklwe.csv");
+        const std::string name = pick(csv_path, "bench_timing_mklwe.csv");
+        std::ofstream timing_csv(name);
         timing_csv << "k,N,n,B,l,log2Q,log2q,operation,count_per_bootstrap,reps,"
                       "min_ms,median_ms,p90_ms,max_ms,mean_ms,stddev_ms,projected_ms\n";
         for (const auto& row : param_rows()) {
             if (only_k != 0 && row.k != only_k) continue;
             rc |= run_timing(row, reps, timing_csv, keygen_csv);
         }
-        std::cout << "\n[bench] timing     CSV -> bench_timing_mklwe.csv\n";
+        std::cout << "\n[bench] timing     CSV -> " << name << "\n";
         break;
     }
     case Mode::Components: {
-        std::ofstream comp_csv("bench_components_mklwe.csv");
+        const std::string name = pick(csv_path, "bench_components_mklwe.csv");
+        std::ofstream comp_csv(name);
         comp_csv << "k,N,n,B,l,log2Q,log2q,component,domain,reps,samples,"
                     "mean,stddev,max_abs,log2_stddev,log2_margin,half_margin,p_fail\n";
         for (const auto& row : param_rows()) {
             if (only_k != 0 && row.k != only_k) continue;
             rc |= run_components(row, reps, comp_csv, keygen_csv);
         }
-        std::cout << "\n[bench] components CSV -> bench_components_mklwe.csv\n";
+        std::cout << "\n[bench] components CSV -> " << name << "\n";
         break;
     }
     case Mode::Growth: {
-        std::ofstream growth_csv("bench_growth_mklwe.csv");
+        const std::string name = pick(csv_path, "bench_growth_mklwe.csv");
+        std::ofstream growth_csv(name);
         growth_csv << "k,N,n,B,l,log2Q,log2q,step,n_added,reps,"
                       "bits_min,bits_mean,bits_max,bits_stddev,budget_bits\n";
         for (const auto& row : param_rows()) {
             if (only_k != 0 && row.k != only_k) continue;
             rc |= run_noise_growth(row, reps, growth_csv, keygen_csv);
         }
-        std::cout << "\n[bench] growth     CSV -> bench_growth_mklwe.csv\n";
+        std::cout << "\n[bench] growth     CSV -> " << name << "\n";
         break;
     }
     case Mode::Protocol:
     default: {
-        std::ofstream protocol_csv("bench_protocol_mklwe.csv");
+        const std::string name = pick(csv_path, "bench_protocol_mklwe.csv");
+        std::ofstream protocol_csv(name);
         protocol_csv << "k,reps,min_ms,median_ms,p90_ms,max_ms,mean_ms,stddev_ms,cold_nand_boot_ms\n";
         for (const auto& row : param_rows()) {
             if (only_k != 0 && row.k != only_k) continue;
             rc |= run_protocol(row, reps, &protocol_csv, keygen_csv);
         }
-        std::cout << "\n[bench] protocol   CSV -> bench_protocol_mklwe.csv\n";
+        std::cout << "\n[bench] protocol   CSV -> " << name << "\n";
         break;
     }
     }
-    std::cout << "[bench] keygen     CSV -> bench_keygen_mklwe.csv\n";
+    std::cout << "[bench] keygen     CSV -> " << keygen_name << "\n";
     return rc;
 }
