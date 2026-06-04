@@ -53,20 +53,15 @@ for idx in "${!ks[@]}"; do
     fi
 
     echo "=================================================================="
-    echo " k=$k  l=$l   --noise-growth  (reps=$REPS)"
+    echo " k=$k  l=$l   --noise-all  (growth + components, reps=$REPS)"
     echo "=================================================================="
-    # --csv / --keygen-csv make the bench write the final filenames directly:
-    # no fixed-name + rename, and concurrent runs never clobber each other.
-    "$BENCH" "$k" --noise-growth --reps "$REPS" \
-        --csv        "$OUTDIR/beijing_k${k}_l${l}_growth.csv" \
-        --keygen-csv "$OUTDIR/beijing_k${k}_l${l}_growth_keygen.csv"
-
-    echo "=================================================================="
-    echo " k=$k  l=$l   --noise          (reps=$REPS)"
-    echo "=================================================================="
-    "$BENCH" "$k" --noise --reps "$REPS" \
-        --csv        "$OUTDIR/beijing_k${k}_l${l}_noise.csv" \
-        --keygen-csv "$OUTDIR/beijing_k${k}_l${l}_noise_keygen.csv"
+    # ONE invocation per k => ONE keygen (MKBTKeyGen) shared by both noise
+    # benches. --growth-csv/--noise-csv/--keygen-csv write final filenames
+    # directly, so concurrent runs never clobber each other.
+    "$BENCH" "$k" --noise-all --reps "$REPS" \
+        --growth-csv "$OUTDIR/beijing_k${k}_l${l}_growth.csv" \
+        --noise-csv  "$OUTDIR/beijing_k${k}_l${l}_noise.csv" \
+        --keygen-csv "$OUTDIR/beijing_k${k}_l${l}_keygen.csv"
 done
 
 echo
