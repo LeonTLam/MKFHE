@@ -7,12 +7,18 @@
 #   k=8  -> l=3 (Bg=512)
 #   k=16 -> l=4 (Bg=128)     # paper's lower-base row
 #
-# For each config it runs:
-#   boolean-mklwe-bench k --noise-growth --reps R   -> beijing_k{k}_l{l}_growth.csv
-#   boolean-mklwe-bench k --noise        --reps R   -> beijing_k{k}_l{l}_noise.csv
+# For each config it runs ONE invocation (one keygen shared by both benches):
+#   boolean-mklwe-bench k --noise-all --reps R
+#     --growth-csv beijing_k{k}_l{l}_growth.csv   (1->256 add trajectory)
+#     --noise-csv  beijing_k{k}_l{l}_noise.csv    (per-stage component noise)
+#     --keygen-csv beijing_k{k}_l{l}_keygen.csv
 #
-# Then (unless --no-pfail) runs scripts/p_fail_calc.py over the *_growth.csv
+# Then (unless NO_PFAIL=1) runs scripts/p_fail_calc.py over the *_growth.csv
 # files, emitting a beijing_k{k}_l{l}_growth_pfail.csv next to each.
+#
+# MEMORY: MKBTKeyGen peaks roughly proportional to k. k=16 (l=4) has been
+# observed to need ~16 GB RSS; on smaller hosts it will OOM. A failing k is
+# reported and skipped -- the remaining configs and the p_fail step still run.
 #
 # Usage:
 #   scripts/run_beijing_bench.sh [reps] [outdir]
@@ -25,7 +31,9 @@
 #   BENCH=/path/to/boolean-mklwe-bench   (default: build/bin/examples/binfhe/...)
 #   REPS_ONLY_K=2|4|8|16                 restrict to a single k
 #   NO_PFAIL=1                           skip the p_fail post-processing
-set -euo pipefail
+# Note: -e is intentionally OFF so one k's failure (e.g. OOM) does not abort
+# the whole sweep.
+set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPS="${1:-100}"
@@ -58,15 +66,26 @@ for idx in "${!ks[@]}"; do
     # ONE invocation per k => ONE keygen (MKBTKeyGen) shared by both noise
     # benches. --growth-csv/--noise-csv/--keygen-csv write final filenames
     # directly, so concurrent runs never clobber each other.
-    "$BENCH" "$k" --noise-all --reps "$REPS" \
+    if "$BENCH" "$k" --noise-all --reps "$REPS" \
         --growth-csv "$OUTDIR/beijing_k${k}_l${l}_growth.csv" \
         --noise-csv  "$OUTDIR/beijing_k${k}_l${l}_noise.csv" \
-        --keygen-csv "$OUTDIR/beijing_k${k}_l${l}_keygen.csv"
+        --keygen-csv "$OUTDIR/beijing_k${k}_l${l}_keygen.csv"; then
+        echo "  [ok] k=$k l=$l complete"
+    else
+        rc=$?
+        echo "  [WARN] k=$k l=$l FAILED (exit $rc) -- likely OOM during MKBTKeyGen" >&2
+        echo "         (k=16 needs ~16 GB). Skipping; continuing with remaining k." >&2
+        # A killed process leaves 0-byte CSVs (header never flushed); drop them.
+        for suf in growth noise keygen; do
+            f="$OUTDIR/beijing_k${k}_l${l}_${suf}.csv"
+            [[ -s "$f" ]] || rm -f "$f"
+        done
+    fi
 done
 
 echo
 echo "Bench CSVs written to $OUTDIR/:"
-ls -1 "$OUTDIR"/beijing_*.csv
+ls -1 "$OUTDIR"/beijing_*.csv 2>/dev/null || echo "  (none)"
 
 if [[ -z "${NO_PFAIL:-}" ]]; then
     echo
