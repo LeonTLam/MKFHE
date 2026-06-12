@@ -62,6 +62,8 @@
 #include "binfhecontext.h"
 #include "binfhe-timing.h"
 
+#include "math/discreteuniformgenerator.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -421,6 +423,48 @@ static MKLWECiphertext mk_add(const MKLWECiphertext& c1, const MKLWECiphertext& 
     return ct;
 }
 
+// ── input-a distribution ──────────────────────────────────────────────────────
+// The upstream MKLWE Encrypt (mklwe-pke.cpp) samples a from a discrete Gaussian
+// (sigma~2), NOT uniform Z_q. That under-exercises the blind rotation, so fresh
+// inputs under-report bootstrap noise. --uniform-a switches the noise-mode
+// inputs to a proper LWE encryption: uniform a_i in Z_q^n for every party, same
+// encoding (b = sum_i <a_i,s_i> + e + Delta*mu) and same error (the scheme's
+// DGG). This matches the paper's intended LWE math and FINALLY's encryption, so
+// the bootstrap noise is comparable scheme-vs-scheme.
+static bool g_uniform_a = false;
+
+static MKLWECiphertext encrypt_uniform_a(BinFHEContext& cc,
+                                         const MKLWEPrivateKey& sk, int m) {
+    const auto& P  = cc.GetParams()->GetMKLWEParams();
+    const NativeInteger q = P->Getq();
+    const uint32_t n = P->Getn();
+    const uint32_t k = P->Getk();
+    const NativeInteger mu = q.ComputeMu();
+
+    NativeInteger b(static_cast<uint64_t>(m % 4) * (q / 4).ConvertToInt());  // Delta = q/4
+    b.ModAddFastEq(P->GetDgg().GenerateInteger(q), q);                        // error e ~ scheme DGG
+
+    auto s = sk->GetElement();
+    std::vector<NativeVector> a(k, NativeVector(n, q));
+    DiscreteUniformGeneratorImpl<NativeVector> dug;
+    dug.SetModulus(q);
+    for (uint32_t u = 0; u < k; ++u) {
+        a[u] = dug.GenerateVector(n);          // uniform a_u in Z_q^n
+        s[u].SwitchModulus(q);
+        for (uint32_t j = 0; j < n; ++j)
+            b.ModAddFastEq(a[u][j].ModMulFast(s[u][j], q, mu), q);
+    }
+    auto ct = std::make_shared<MKLWECiphertextImpl>(std::move(a), b);
+    ct->SetptModulus(4);
+    return ct;
+}
+
+// Fresh ciphertext for the noise modes: scheme-as-implemented (Gaussian a) by
+// default, or proper uniform-a LWE under --uniform-a.
+static MKLWECiphertext enc(BinFHEContext& cc, const MKLWEPrivateKey& sk, int m) {
+    return g_uniform_a ? encrypt_uniform_a(cc, sk, m) : cc.Encrypt(sk, m);
+}
+
 // ── noise statistics (shared by --components) ─────────────────────────────────
 // Streaming accumulator: never stores the samples (count can be large), keeps a
 // running mean / variance and the worst-case max-abs.
@@ -607,11 +651,11 @@ static int run_components(const ParamRow& row, int reps, int boot_reps,
     // Cheap stages: fresh Encrypt(0) and one homomorphic Add (no bootstrap).
     for (int r = 0; r < reps; ++r) {
         // Fresh Encrypt(0): message 0 => centred phase is the signed noise.
-        MKLWECiphertext c0a = cc.Encrypt(sk, 0);
+        MKLWECiphertext c0a = enc(cc, sk, 0);
         st_fresh.push(static_cast<double>(lwe_centered_phase(sk, c0a)));
 
         // Homomorphic Add of two fresh Enc(0): still message 0.
-        MKLWECiphertext c0b = cc.Encrypt(sk, 0);
+        MKLWECiphertext c0b = enc(cc, sk, 0);
         MKLWECiphertext cadd = mk_add(c0a, c0b);
         st_add.push(static_cast<double>(lwe_centered_phase(sk, cadd)));
     }
@@ -623,8 +667,8 @@ static int run_components(const ParamRow& row, int reps, int boot_reps,
                   << boot_reps << " ..." << std::flush;
         // NAND+Bootstrap output: NAND(1,0)=1 => codeword q/4. Report the signed
         // noise relative to the nearest codeword so stddev is zero-mean.
-        MKLWECiphertext a1 = cc.Encrypt(sk, 1);
-        MKLWECiphertext b0 = cc.Encrypt(sk, 0);
+        MKLWECiphertext a1 = enc(cc, sk, 1);
+        MKLWECiphertext b0 = enc(cc, sk, 0);
         MKLWECiphertext out = cc.EvalBinGate(NAND, a1, b0);
         st_boot.push(static_cast<double>(lwe_signed_noise(lwe_centered_phase(sk, out), qi)));
     }
@@ -714,7 +758,7 @@ static int run_noise_growth(const ParamRow& row, int reps, int boot_reps,
         bool init = false;
         std::size_t ci = 0;
         for (std::size_t count = 1; count <= add_counts.back(); ++count) {
-            MKLWECiphertext ct = cc.Encrypt(sk, 0);
+            MKLWECiphertext ct = enc(cc, sk, 0);
             acc = init ? mk_add(acc, ct) : ct;
             init = true;
             if (ci < add_counts.size() && count == add_counts[ci]) {
@@ -728,7 +772,7 @@ static int run_noise_growth(const ParamRow& row, int reps, int boot_reps,
             std::cout << "\r  growth: rep " << (r + 1) << "/" << reps
                       << "  bootstrap-reset " << (r + 1) << "/" << boot_reps
                       << " ..." << std::string(8, ' ') << std::flush;
-            MKLWECiphertext one = cc.Encrypt(sk, 1);
+            MKLWECiphertext one = enc(cc, sk, 1);
             MKLWECiphertext out = cc.EvalBinGate(NAND, acc, one);
             boot_samples.push_back(noise_bits(out));
         }
@@ -1016,6 +1060,9 @@ static void print_usage(const char* prog) {
         "                   multi-second op. Default = --reps. Use a small value to\n"
         "                   keep large-k (e.g. k=16) runs tractable while fresh/add/\n"
         "                   trajectory stats stay at full --reps.\n"
+        "  --uniform-a      Noise modes: build inputs as proper uniform-a LWE\n"
+        "                   (paper/FINALLY math) instead of the upstream Gaussian-a\n"
+        "                   Encrypt; needed for scheme-vs-scheme noise comparison.\n"
         "  --csv PATH       Write the active mode's CSV to PATH instead of the\n"
         "                   default bench_<mode>_mklwe.csv (single-mode runs only;\n"
         "                   final name written directly -- no rename needed).\n"
@@ -1048,6 +1095,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--components" || a == "--noise"){ mode = Mode::Components; }
         else if (a == "--growth" || a == "--noise-growth") { mode = Mode::Growth; }
         else if (a == "--noise-all")                   { mode = Mode::NoiseAll; }
+        else if (a == "--uniform-a")                   { g_uniform_a = true; }
         else if (a == "--reps" && i + 1 < argc)        { reps = std::atoi(argv[++i]); }
         else if (a == "--boot-reps" && i + 1 < argc)   { boot_reps = std::atoi(argv[++i]); }
         else if (a == "--csv" && i + 1 < argc)         { csv_path = argv[++i]; }
