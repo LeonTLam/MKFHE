@@ -205,7 +205,10 @@ def print_report(path: Path, row: BootstrapRow) -> None:
     # recovers sigma from bits_mean, and computes the tail probability
     # against the decryption threshold.  This is the bound to compare
     # against the paper's 2^-200 claim.
-    pfail_theoretical = estimates["gaussian_q_over_4"]
+    # Decode boundary for a boolean message at Delta = q/4 is the MIDPOINT q/8
+    # (|e| > q/8 flips the decoded bit), matching FINALLY. This q/8 tail is the
+    # correct decryption-failure probability and the one we headline.
+    pfail_theoretical = estimates["gaussian_q_over_8"]
 
     # Empirical "consistency check".  Treats log2|noise| as normal with
     # the measured (mean, stddev).  ALWAYS more pessimistic than the
@@ -222,9 +225,9 @@ def print_report(path: Path, row: BootstrapRow) -> None:
     empirical_floor_p95 = -math.log2(row.reps / 3.0) if row.reps >= 3 else 0.0
 
     print(f"\n  Theoretical p_fail (standard FHE bound, Gaussian on linear sigma):")
-    print(f"    budget = q/4:  log2(p_fail) = " + _fmt_log2(pfail_theoretical))
-    print(f"    budget = q/8:  log2(p_fail) = " + _fmt_log2(estimates['gaussian_q_over_8']))
-    print(f"    -- This is the bound the paper's noise analysis produces.  Compare to 2^-200 claim.")
+    print(f"    budget = q/8 (decode boundary):  log2(p_fail) = " + _fmt_log2(pfail_theoretical))
+    print(f"    budget = q/4 (codeword spacing): log2(p_fail) = " + _fmt_log2(estimates['gaussian_q_over_4']))
+    print(f"    -- q/8 is the correct decode boundary (FINALLY); compare to 2^-200 claim.")
 
     print(f"\n  Empirical consistency check (log-normal extrapolation):")
     print(f"    log2(p_fail) = " + _fmt_log2(pfail_empirical))
@@ -239,7 +242,7 @@ def print_report(path: Path, row: BootstrapRow) -> None:
     print(f"    -- The paper's 2^-200 claim is not directly empirically verifiable")
     print(f"       at this rep count; it requires the theoretical analysis above.")
 
-    print(f"\n  Target thresholds (against THEORETICAL bound, Gaussian@q/4):")
+    print(f"\n  Target thresholds (against THEORETICAL bound, Gaussian@q/8):")
     for name, meets in check_targets(pfail_theoretical):
         mark = "PASS" if meets else "FAIL"
         print(f"    [{mark}]  {name}")
@@ -263,7 +266,7 @@ def _fmt_log2(val: float) -> str:
 # Header of the per-input p_fail CSV. One data row per input file: the parsed
 # bootstrap distribution, all four p_fail estimates (log2 units), the empirical
 # observable floors, and PASS/FAIL flags for each target threshold (evaluated
-# against the theoretical Gaussian@q/4 bound -- the one comparable to the paper).
+# against the theoretical Gaussian@q/8 bound (q/8 = decode boundary, FINALLY).
 PFAIL_CSV_COLUMNS = [
     "file", "k", "N", "n", "B", "l", "log2Q", "log2q", "reps",
     "bits_min", "bits_mean", "bits_max", "bits_stddev", "budget_bits",
@@ -277,7 +280,7 @@ PFAIL_CSV_COLUMNS = [
 
 def write_pfail_csv(in_path: Path, row: BootstrapRow, out_dir: Path | None) -> Path:
     est = estimate_pfail(row)
-    theo = est["gaussian_q_over_4"]
+    theo = est["gaussian_q_over_8"]   # q/8 = decode boundary (FINALLY)
     meets = {name: ("PASS" if ok else "FAIL") for name, ok in check_targets(theo)}
     floor_p63 = -math.log2(row.reps) if row.reps > 0 else 0.0
     floor_p95 = -math.log2(row.reps / 3.0) if row.reps >= 3 else 0.0
@@ -373,11 +376,11 @@ def main(argv: list[str]) -> int:
 
     if len(rows) > 1:
         print(f"\n{'='*78}")
-        print("  SUMMARY (Gaussian@q/4, log_2 units)")
+        print("  SUMMARY (Gaussian@q/8 decode boundary, log_2 units)")
         print(f"{'='*78}")
         print(f"  {'file':40s}  {'(k,l,B)':18s}  {'log2(p_fail)':>14s}  paper")
         for path, row in rows:
-            pfail = estimate_pfail(row)["gaussian_q_over_4"]
+            pfail = estimate_pfail(row)["gaussian_q_over_8"]
             klb = f"({row.k},{row.l},B={row.B})"
             meets_paper = "PASS" if pfail <= -200 else "FAIL"
             pfail_str = (f"2^{pfail:8.2e}" if abs(pfail) > 1e6
