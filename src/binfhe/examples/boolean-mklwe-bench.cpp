@@ -588,13 +588,15 @@ static int run_timing(const ParamRow& row, int reps,
 // margin = q/8 = Delta/2 is the half-window a coefficient may drift before the
 // decoded bit flips.
 // Core measurement only: keys (cc, sk) are generated ONCE by the caller and
-// reused here, so a combined run does not pay MKBTKeyGen twice.
-static int run_components(const ParamRow& row, int reps,
+// reused here, so a combined run does not pay MKBTKeyGen twice. The fresh/add
+// stages run `reps` times (cheap); the NAND+Bootstrap stage runs `boot_reps`
+// times (one full gate each -- the expensive part) with live progress.
+static int run_components(const ParamRow& row, int reps, int boot_reps,
                           std::ofstream& comp_csv,
                           BinFHEContext& cc, const MKLWEPrivateKey& sk)
 {
     std::cout << "\n  --- Components (per-stage LWE noise) benchmark  (k=" << row.k
-              << ", reps=" << reps << ") ---\n";
+              << ", reps=" << reps << ", boot_reps=" << boot_reps << ") ---\n";
 
     const auto& P  = cc.GetParams()->GetMKLWEParams();
     const long  qi = static_cast<long>(P->Getq().ConvertToInt());
@@ -602,8 +604,7 @@ static int run_components(const ParamRow& row, int reps,
 
     NoiseStats st_fresh, st_add, st_boot;
 
-    std::cout << "\n  measuring per-stage LWE noise over " << reps << " reps/stage ..."
-              << std::flush;
+    // Cheap stages: fresh Encrypt(0) and one homomorphic Add (no bootstrap).
     for (int r = 0; r < reps; ++r) {
         // Fresh Encrypt(0): message 0 => centred phase is the signed noise.
         MKLWECiphertext c0a = cc.Encrypt(sk, 0);
@@ -613,7 +614,13 @@ static int run_components(const ParamRow& row, int reps,
         MKLWECiphertext c0b = cc.Encrypt(sk, 0);
         MKLWECiphertext cadd = mk_add(c0a, c0b);
         st_add.push(static_cast<double>(lwe_centered_phase(sk, cadd)));
+    }
 
+    // Expensive stage: one full gate (bootstrap) per rep. Progress-reported so a
+    // slow k (e.g. k=16, multi-second/gate) does not look hung.
+    for (int r = 0; r < boot_reps; ++r) {
+        std::cout << "\r  NAND+Bootstrap stage: bootstrap " << (r + 1) << "/"
+                  << boot_reps << " ..." << std::flush;
         // NAND+Bootstrap output: NAND(1,0)=1 => codeword q/4. Report the signed
         // noise relative to the nearest codeword so stddev is zero-mean.
         MKLWECiphertext a1 = cc.Encrypt(sk, 1);
@@ -621,7 +628,8 @@ static int run_components(const ParamRow& row, int reps,
         MKLWECiphertext out = cc.EvalBinGate(NAND, a1, b0);
         st_boot.push(static_cast<double>(lwe_signed_noise(lwe_centered_phase(sk, out), qi)));
     }
-    std::cout << " done\n";
+    std::cout << "\r  NAND+Bootstrap stage: " << boot_reps << " bootstraps done"
+              << std::string(12, ' ') << "\n";
 
     // ── Table ─────────────────────────────────────────────────────────────────
     std::cout << "\n  Per-stage LWE noise + decode error rate (magnitudes in log2 bits):\n";
@@ -650,7 +658,7 @@ static int run_components(const ParamRow& row, int reps,
     auto write_row = [&](const std::string& nm, const std::string& dom,
                          const NoiseStats& st, double margin) {
         comp_csv << csv_param_prefix(row) << ",\"" << nm << "\",\"" << dom << "\","
-                 << reps << "," << st.count << ","
+                 << st.count << "," << st.count << ","
                  << std::scientific << std::setprecision(8)
                  << st.mean() << "," << st.stddev() << "," << st.max_abs << ","
                  << std::fixed << std::setprecision(4)
@@ -674,12 +682,12 @@ static int run_components(const ParamRow& row, int reps,
 // growth->reset sawtooth.
 // Core measurement only: keys (cc, sk) are generated ONCE by the caller and
 // reused here (no second MKBTKeyGen for a combined run).
-static int run_noise_growth(const ParamRow& row, int reps,
+static int run_noise_growth(const ParamRow& row, int reps, int boot_reps,
                             std::ofstream& growth_csv,
                             BinFHEContext& cc, const MKLWEPrivateKey& sk)
 {
     std::cout << "\n  --- Noise-growth (grow via Add, reset via Bootstrap) benchmark  (k="
-              << row.k << ", reps=" << reps << ") ---\n";
+              << row.k << ", reps=" << reps << ", boot_reps=" << boot_reps << ") ---\n";
 
     const auto& P  = cc.GetParams()->GetMKLWEParams();
     const long  qi = static_cast<long>(P->Getq().ConvertToInt());
@@ -692,13 +700,16 @@ static int run_noise_growth(const ParamRow& row, int reps,
     };
 
     std::cout << "\n  --growth: " << reps
-              << " reps  (LWE noise in log2 bits; decode budget = log2(q/8) = "
+              << " trajectory reps, " << boot_reps
+              << " bootstrap-reset reps  (LWE noise in log2 bits; decode budget = log2(q/8) = "
               << std::fixed << std::setprecision(1) << budget_bits << " bits)\n";
 
     std::vector<std::vector<double>> growth(add_counts.size());
     std::vector<double> boot_samples;
 
     for (int r = 0; r < reps; ++r) {
+        std::cout << "\r  growth trajectory: rep " << (r + 1) << "/" << reps
+                  << " ..." << std::flush;
         MKLWECiphertext acc;
         bool init = false;
         std::size_t ci = 0;
@@ -711,11 +722,19 @@ static int run_noise_growth(const ParamRow& row, int reps,
                 ++ci;
             }
         }
-        // Bootstrap the (still-decrypts-to-0) accumulator: NAND(0,1)=1 resets noise.
-        MKLWECiphertext one = cc.Encrypt(sk, 1);
-        MKLWECiphertext out = cc.EvalBinGate(NAND, acc, one);
-        boot_samples.push_back(noise_bits(out));
+        // Bootstrap the (still-decrypts-to-0) accumulator: NAND(0,1)=1 resets
+        // noise. Only the first `boot_reps` reps pay this (expensive) gate.
+        if (r < boot_reps) {
+            std::cout << "\r  growth: rep " << (r + 1) << "/" << reps
+                      << "  bootstrap-reset " << (r + 1) << "/" << boot_reps
+                      << " ..." << std::string(8, ' ') << std::flush;
+            MKLWECiphertext one = cc.Encrypt(sk, 1);
+            MKLWECiphertext out = cc.EvalBinGate(NAND, acc, one);
+            boot_samples.push_back(noise_bits(out));
+        }
     }
+    std::cout << "\r  growth: " << reps << " trajectory reps, " << boot_reps
+              << " bootstrap resets done" << std::string(12, ' ') << "\n";
 
     // ── Table ─────────────────────────────────────────────────────────────────
     std::cout << "\n  Noise growth trajectory (log2 |e| bits):\n";
@@ -775,14 +794,15 @@ static int run_noise_growth(const ParamRow& row, int reps,
 // step, so it is done exactly once here and shared by both noise benches. This
 // is why --growth, --noise, and --noise-all all route through this driver: a
 // combined run pays a single keygen per k (and writes a single keygen row).
-static int run_noise_for_k(const ParamRow& row, int reps,
+static int run_noise_for_k(const ParamRow& row, int reps, int boot_reps,
                            bool do_growth, bool do_components,
                            std::ofstream* growth_csv, std::ofstream* comp_csv,
                            std::ofstream& keygen_csv)
 {
     std::cout << "\n========================================================\n"
               << "  MKFHE Alg.2 (LWE) - Noise Benchmark  (k=" << row.k << ")\n"
-              << "  Parameter set: " << row.name << "    reps=" << reps << "\n"
+              << "  Parameter set: " << row.name << "    reps=" << reps
+              << "  boot_reps=" << boot_reps << "\n"
               << "  Modes:" << (do_growth ? " noise-growth" : "")
               << (do_components ? " components" : "") << "\n"
               << "========================================================\n";
@@ -793,8 +813,8 @@ static int run_noise_for_k(const ParamRow& row, int reps,
     write_keygen_csv_row(keygen_csv, row, kg);               // one keygen row per k
 
     int rc = 0;
-    if (do_growth     && growth_csv) rc |= run_noise_growth(row, reps, *growth_csv, cc, sk);
-    if (do_components && comp_csv)    rc |= run_components(row, reps, *comp_csv, cc, sk);
+    if (do_growth     && growth_csv) rc |= run_noise_growth(row, reps, boot_reps, *growth_csv, cc, sk);
+    if (do_components && comp_csv)    rc |= run_components(row, reps, boot_reps, *comp_csv, cc, sk);
     return rc;
 }
 
@@ -991,6 +1011,11 @@ static void print_usage(const char* prog) {
         "                            CSVs -> bench_growth_mklwe.csv + bench_components_mklwe.csv\n\n"
         "Options:\n"
         "  --reps N         Sample count (default 20; --timing defaults to 100).\n"
+        "  --boot-reps N    Cap reps for the bootstrap-bearing noise stages\n"
+        "                   (components 'NAND+Bootstrap', growth 'reset'); the only\n"
+        "                   multi-second op. Default = --reps. Use a small value to\n"
+        "                   keep large-k (e.g. k=16) runs tractable while fresh/add/\n"
+        "                   trajectory stats stay at full --reps.\n"
         "  --csv PATH       Write the active mode's CSV to PATH instead of the\n"
         "                   default bench_<mode>_mklwe.csv (single-mode runs only;\n"
         "                   final name written directly -- no rename needed).\n"
@@ -1007,9 +1032,10 @@ static void print_usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
-    Mode mode   = Mode::Protocol;
-    int  reps   = -1;
-    int  only_k = 0;
+    Mode mode      = Mode::Protocol;
+    int  reps      = -1;
+    int  boot_reps = -1;         // --boot-reps: cap the (expensive) bootstrap stages
+    int  only_k    = 0;
     std::string csv_path;        // --csv: override the active (single) mode's CSV path
     std::string growth_path;     // --growth-csv: --noise-all growth CSV path
     std::string noise_path;      // --noise-csv:  --noise-all components CSV path
@@ -1023,6 +1049,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--growth" || a == "--noise-growth") { mode = Mode::Growth; }
         else if (a == "--noise-all")                   { mode = Mode::NoiseAll; }
         else if (a == "--reps" && i + 1 < argc)        { reps = std::atoi(argv[++i]); }
+        else if (a == "--boot-reps" && i + 1 < argc)   { boot_reps = std::atoi(argv[++i]); }
         else if (a == "--csv" && i + 1 < argc)         { csv_path = argv[++i]; }
         else if (a == "--growth-csv" && i + 1 < argc)  { growth_path = argv[++i]; }
         else if (a == "--noise-csv" && i + 1 < argc)   { noise_path = argv[++i]; }
@@ -1035,6 +1062,12 @@ int main(int argc, char* argv[]) {
     }
     if (reps < 0) reps = (mode == Mode::Timing) ? 100 : 20;
     if (reps < 1) reps = 1;
+    // Bootstrap stages default to reps; cap them with --boot-reps (the bootstrap
+    // is the only multi-second op, so a small value keeps large-k runs tractable
+    // while the cheap fresh/add/trajectory stats stay at full reps).
+    if (boot_reps < 0)    boot_reps = reps;
+    if (boot_reps < 1)    boot_reps = 1;
+    if (boot_reps > reps) boot_reps = reps;
 
     // CSV destinations: --csv / --keygen-csv override the defaults so the wrapper
     // can ask for the final filename directly (no fixed-name + rename dance).
@@ -1068,7 +1101,7 @@ int main(int argc, char* argv[]) {
                     "mean,stddev,max_abs,log2_stddev,log2_margin,half_margin,p_fail\n";
         for (const auto& row : param_rows()) {
             if (only_k != 0 && row.k != only_k) continue;
-            rc |= run_noise_for_k(row, reps, /*growth=*/false, /*components=*/true,
+            rc |= run_noise_for_k(row, reps, boot_reps, /*growth=*/false, /*components=*/true,
                                   nullptr, &comp_csv, keygen_csv);
         }
         std::cout << "\n[bench] components CSV -> " << name << "\n";
@@ -1081,7 +1114,7 @@ int main(int argc, char* argv[]) {
                       "bits_min,bits_mean,bits_max,bits_stddev,budget_bits\n";
         for (const auto& row : param_rows()) {
             if (only_k != 0 && row.k != only_k) continue;
-            rc |= run_noise_for_k(row, reps, /*growth=*/true, /*components=*/false,
+            rc |= run_noise_for_k(row, reps, boot_reps, /*growth=*/true, /*components=*/false,
                                   &growth_csv, nullptr, keygen_csv);
         }
         std::cout << "\n[bench] growth     CSV -> " << name << "\n";
@@ -1099,7 +1132,7 @@ int main(int argc, char* argv[]) {
                     "mean,stddev,max_abs,log2_stddev,log2_margin,half_margin,p_fail\n";
         for (const auto& row : param_rows()) {
             if (only_k != 0 && row.k != only_k) continue;
-            rc |= run_noise_for_k(row, reps, /*growth=*/true, /*components=*/true,
+            rc |= run_noise_for_k(row, reps, boot_reps, /*growth=*/true, /*components=*/true,
                                   &growth_csv, &comp_csv, keygen_csv);
         }
         std::cout << "\n[bench] growth     CSV -> " << gname << "\n";

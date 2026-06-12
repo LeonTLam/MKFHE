@@ -40,6 +40,10 @@ REPS="${1:-100}"
 OUTDIR="${2:-beijing_results}"
 BENCH="${BENCH:-$ROOT/build/bin/examples/binfhe/boolean-mklwe-bench}"
 PFAIL="$ROOT/scripts/p_fail_calc.py"
+# Cap the (multi-second) bootstrap stages so large k (k=16 ~Ns/gate) stays
+# tractable; the cheap fresh/add/trajectory stats still use the full REPS.
+# Override with BOOT_REPS=...; set BOOT_REPS="$REPS" to disable the cap.
+BOOT_REPS="${BOOT_REPS:-$(( REPS < 25 ? REPS : 25 ))}"
 
 if [[ ! -x "$BENCH" ]]; then
     echo "ERROR: bench binary not found/executable: $BENCH" >&2
@@ -61,12 +65,13 @@ for idx in "${!ks[@]}"; do
     fi
 
     echo "=================================================================="
-    echo " k=$k  l=$l   --noise-all  (growth + components, reps=$REPS)"
+    echo " k=$k  l=$l   --noise-all  (growth + components, reps=$REPS, boot_reps=$BOOT_REPS)"
     echo "=================================================================="
     # ONE invocation per k => ONE keygen (MKBTKeyGen) shared by both noise
     # benches. --growth-csv/--noise-csv/--keygen-csv write final filenames
-    # directly, so concurrent runs never clobber each other.
-    if "$BENCH" "$k" --noise-all --reps "$REPS" \
+    # directly, so concurrent runs never clobber each other. --boot-reps caps
+    # the expensive bootstrap stages so k=16 finishes in minutes, not an hour.
+    if "$BENCH" "$k" --noise-all --reps "$REPS" --boot-reps "$BOOT_REPS" \
         --growth-csv "$OUTDIR/beijing_k${k}_l${l}_growth.csv" \
         --noise-csv  "$OUTDIR/beijing_k${k}_l${l}_noise.csv" \
         --keygen-csv "$OUTDIR/beijing_k${k}_l${l}_keygen.csv"; then
